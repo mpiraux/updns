@@ -9,8 +9,43 @@ pub struct Args {
     pub run: RunType,
 }
 
+#[derive(Clone, Copy)]
+pub enum RunMode {
+    V4,
+    V6,
+    V4inV6,
+    V6inV4,
+}
+
+impl RunMode {
+    fn values_str<'a>() -> &'a [&'a str] {
+        &["v4", "v6", "v4inv6", "v6inv4"]
+    }
+
+    fn from_str(s: &str) -> Result<Self, &str> {
+        match s.to_lowercase().as_str() {
+            "v4" => Ok(RunMode::V4),
+            "v6" => Ok(RunMode::V6),
+            "v4inv6" => Ok(RunMode::V4inV6),
+            "v6inv4" => Ok(RunMode::V6inV4),
+            _ => Err("Unknown run mode"),
+        }
+    }
+}
+
+impl From<RunMode> for &str {
+    fn from(value: RunMode) -> Self {
+        match value {
+            RunMode::V4 => "v4",
+            RunMode::V6 => "v6",
+            RunMode::V4inV6 => "v4inv6",
+            RunMode::V6inV4 => "v6inv4",
+        }
+    }
+}
+
 pub enum RunType {
-    Start,
+    Start(RunMode),
     AddRecord { ip: String, host: String },
     PrintRecord,
     EditConfig,
@@ -57,6 +92,13 @@ pub fn parse_args() -> Args {
         .subcommand(Command::new("ls").about("Print all configured DNS records"))
         .subcommand(Command::new("edit").about("Call 'vim' to edit the configuration file"))
         .subcommand(Command::new("path").about("Print related directories"))
+        .subcommand(
+            Command::new("run").about("Run UDPNS").arg(
+                Arg::with_name("mode")
+                    .possible_values(RunMode::values_str())
+                    .default_value(RunMode::V4inV6.into()),
+            ),
+        )
         .get_matches();
 
     let level = matches.value_of("log").unwrap();
@@ -78,8 +120,15 @@ pub fn parse_args() -> Args {
     match matches.subcommand() {
         None => Args {
             path,
-            run: RunType::Start,
+            run: RunType::Start(RunMode::V4inV6),
         },
+        Some(("run", matches)) => {
+            let mode = matches.value_of("mode").unwrap_or("");
+            Args {
+                path,
+                run: RunType::Start(RunMode::from_str(mode).unwrap()),
+            }
+        }
         Some(("add", matches)) => {
             let host = matches.value_of("host").unwrap();
             let ip = matches.value_of("ip").unwrap();

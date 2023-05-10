@@ -7,15 +7,18 @@
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+const MAX_BUFFER_SIZE: usize = 4096;
+
+#[derive(Debug)]
 pub struct BytePacketBuffer {
-    pub buf: [u8; 512],
+    pub buf: [u8; MAX_BUFFER_SIZE],
     pub pos: usize,
 }
 
 impl BytePacketBuffer {
     pub fn new() -> BytePacketBuffer {
         BytePacketBuffer {
-            buf: [0; 512],
+            buf: [0; MAX_BUFFER_SIZE],
             pos: 0,
         }
     }
@@ -37,7 +40,7 @@ impl BytePacketBuffer {
     }
 
     fn read(&mut self) -> Result<u8> {
-        if self.pos >= 512 {
+        if self.pos >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
         }
         let res = self.buf[self.pos];
@@ -47,14 +50,14 @@ impl BytePacketBuffer {
     }
 
     fn get(&mut self, pos: usize) -> Result<u8> {
-        if pos >= 512 {
+        if pos >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
         }
         Ok(self.buf[pos])
     }
 
     pub fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
-        if start + len >= 512 {
+        if start + len >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
         }
         Ok(&self.buf[start..start + len as usize])
@@ -126,7 +129,7 @@ impl BytePacketBuffer {
     }
 
     fn write(&mut self, val: u8) -> Result<()> {
-        if self.pos >= 512 {
+        if self.pos >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
         }
         self.buf[self.pos] = val;
@@ -174,8 +177,17 @@ impl BytePacketBuffer {
             }
         }
 
-        self.write_u8(0)?;
+        if qname != "" {
+            self.write_u8(0)?;
+        }
 
+        Ok(())
+    }
+
+    fn write_buf(&mut self, buf: &[u8]) -> Result<()> {
+        for b in buf {
+            self.write_u8(*b)?;
+        }
         Ok(())
     }
 
@@ -323,6 +335,7 @@ pub enum QueryType {
     A,     // 1
     NS,    // 2
     CNAME, // 5
+    SOA,   // 6
     MX,    // 15
     AAAA,  // 28
 }
@@ -334,6 +347,7 @@ impl QueryType {
             QueryType::A => 1,
             QueryType::NS => 2,
             QueryType::CNAME => 5,
+            QueryType::SOA => 6,
             QueryType::MX => 15,
             QueryType::AAAA => 28,
         }
@@ -344,6 +358,7 @@ impl QueryType {
             1 => QueryType::A,
             2 => QueryType::NS,
             5 => QueryType::CNAME,
+            6 => QueryType::SOA,
             15 => QueryType::MX,
             28 => QueryType::AAAA,
             _ => QueryType::UNKNOWN(num),
@@ -390,8 +405,10 @@ pub enum DnsRecord {
     UNKNOWN {
         domain: String,
         qtype: u16,
-        data_len: u16,
+        class: u16,
         ttl: u32,
+        data_len: u16,
+        data_bytes: Vec<u8>,
     }, // 0
     A {
         domain: String,
@@ -408,6 +425,17 @@ pub enum DnsRecord {
         host: String,
         ttl: u32,
     }, // 5
+    SOA {
+        domain: String,
+        ttl: u32,
+        name: String,
+        mailbox: String,
+        serial: u32,
+        refresh_it: u32,
+        retry_it: u32,
+        expire_lim: u32,
+        min_ttl: u32,
+    }, // 6
     MX {
         domain: String,
         priority: u16,
@@ -428,7 +456,7 @@ impl DnsRecord {
 
         let qtype_num = buffer.read_u16()?;
         let qtype = QueryType::from_num(qtype_num);
-        let _ = buffer.read_u16()?;
+        let class = buffer.read_u16()?;
         let ttl = buffer.read_u32()?;
         let data_len = buffer.read_u16()?;
 
@@ -490,6 +518,29 @@ impl DnsRecord {
                     ttl: ttl,
                 })
             }
+            QueryType::SOA => {
+                let mut name = String::new();
+                buffer.read_qname(&mut name)?;
+                let mut mailbox = String::new();
+                buffer.read_qname(&mut mailbox)?;
+                let serial = buffer.read_u32()?;
+                let refresh_it = buffer.read_u32()?;
+                let retry_it = buffer.read_u32()?;
+                let expire_lim = buffer.read_u32()?;
+                let min_ttl = buffer.read_u32()?;
+
+                Ok(DnsRecord::SOA {
+                    domain,
+                    ttl,
+                    name,
+                    mailbox,
+                    serial,
+                    refresh_it,
+                    retry_it,
+                    expire_lim,
+                    min_ttl,
+                })
+            }
             QueryType::MX => {
                 let priority = buffer.read_u16()?;
                 let mut mx = String::new();
@@ -503,14 +554,18 @@ impl DnsRecord {
                 })
             }
             QueryType::UNKNOWN(_) => {
-                buffer.step(data_len as usize)?;
-
-                Ok(DnsRecord::UNKNOWN {
+                let data_bytes = buffer.get_range(buffer.pos, data_len as usize)?.to_vec();
+                buffer.step(data_bytes.len())?;
+                let record = DnsRecord::UNKNOWN {
                     domain: domain,
                     qtype: qtype_num,
+                    class: class,
                     data_len: data_len,
                     ttl: ttl,
-                })
+                    data_bytes: data_bytes,
+                };
+
+                Ok(record)
             }
         }
     }
@@ -572,6 +627,36 @@ impl DnsRecord {
                 let size = buffer.pos() - (pos + 2);
                 buffer.set_u16(pos, size as u16)?;
             }
+            DnsRecord::SOA {
+                ref domain,
+                ttl,
+                ref name,
+                ref mailbox,
+                serial,
+                refresh_it,
+                retry_it,
+                expire_lim,
+                min_ttl,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(QueryType::SOA.to_num())?;
+                buffer.write_u16(1)?;
+                buffer.write_u32(ttl)?;
+
+                let pos = buffer.pos();
+                buffer.write_u16(0)?;
+
+                buffer.write_qname(name)?;
+                buffer.write_qname(mailbox)?;
+                buffer.write_u32(serial)?;
+                buffer.write_u32(refresh_it)?;
+                buffer.write_u32(retry_it)?;
+                buffer.write_u32(expire_lim)?;
+                buffer.write_u32(min_ttl)?;
+
+                let size = buffer.pos() - (pos + 2);
+                buffer.set_u16(pos, size as u16)?;
+            }
             DnsRecord::MX {
                 ref domain,
                 priority,
@@ -607,8 +692,20 @@ impl DnsRecord {
                     buffer.write_u16(*octet)?;
                 }
             }
-            DnsRecord::UNKNOWN { .. } => {
-                logs::warn!("Skipping record: {:?}", self);
+            DnsRecord::UNKNOWN {
+                ref domain,
+                qtype,
+                class,
+                data_len,
+                ttl,
+                ref data_bytes,
+            } => {
+                buffer.write_qname(domain)?;
+                buffer.write_u16(qtype)?;
+                buffer.write_u16(class)?;
+                buffer.write_u32(ttl)?;
+                buffer.write_u16(data_len)?;
+                buffer.write_buf(data_bytes)?;
             }
         }
 

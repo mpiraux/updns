@@ -3,7 +3,7 @@ mod config;
 mod matcher;
 mod watch;
 
-use cli::{parse_args, Args, RunType};
+use cli::{parse_args, Args, RunMode, RunType};
 use config::{Config, Hosts, MultipleInvalid, Parser};
 use futures_util::StreamExt;
 use lazy_static::lazy_static;
@@ -89,12 +89,13 @@ async fn main() {
 
             println!("Binary: {}\nConfig: {}", binary.display(), path.display());
         }
-        RunType::Start => {
+        RunType::Start(mode) => {
             let mut config = force_get_config(&path).await;
             if config.bind.is_empty() {
                 warn!("Will bind the default address '{}'", DEFAULT_BIND);
                 config.bind.push(DEFAULT_BIND.parse().unwrap());
             }
+            info!("Run mode {:?}", <&str>::from(mode));
             if config.proxy.is_empty() {
                 warn!(
                     "Will use the default proxy address '{}'",
@@ -106,7 +107,7 @@ async fn main() {
 
             // Run server
             for addr in config.bind {
-                tokio::spawn(run_server(addr));
+                tokio::spawn(run_server(addr, mode));
             }
             // watch config
             watch_config(path, WATCH_INTERVAL).await;
@@ -163,7 +164,7 @@ async fn watch_config(p: PathBuf, d: Duration) {
     }
 }
 
-async fn run_server(addr: SocketAddr) {
+async fn run_server(addr: SocketAddr, mode: RunMode) {
     let socket = match UdpSocket::bind(&addr).await {
         Ok(socket) => {
             info!("Start listening to '{}'", addr);
@@ -185,7 +186,7 @@ async fn run_server(addr: SocketAddr) {
             }
         };
 
-        let res = match handle(req, len).await {
+        let res = match handle(req, len, mode).await {
             Ok(data) => data,
             Err(err) => {
                 error!("Processing request failed {:?}", err);
@@ -257,8 +258,9 @@ async fn get_answer(domain: &str, query: QueryType) -> Option<DnsRecord> {
     None
 }
 
-async fn handle(mut req: BytePacketBuffer, len: usize) -> Result<Vec<u8>> {
+async fn handle(mut req: BytePacketBuffer, len: usize, mode: RunMode) -> Result<Vec<u8>> {
     let mut request = DnsPacket::from_buffer(&mut req)?;
+    assert!(request.questions.len() < 2);
 
     let query = match request.questions.get(0) {
         Some(q) => q,
@@ -267,19 +269,68 @@ async fn handle(mut req: BytePacketBuffer, len: usize) -> Result<Vec<u8>> {
 
     info!("{} {:?}", query.name, query.qtype);
 
-    // Whether to proxy
-    let answer = match get_answer(&query.name, query.qtype).await {
-        Some(record) => record,
-        None => return proxy(&req.buf[..len]).await,
-    };
+    match mode {
+        RunMode::V4 => {
+            if query.qtype != QueryType::AAAA {
+                return proxy(&req.buf[..len]).await;
+            }
+        }
+        RunMode::V6 => {
+            if query.qtype != QueryType::A {
+                return proxy(&req.buf[..len]).await;
+            }
+        }
+        RunMode::V4inV6 => {
+            if query.qtype != QueryType::A {
+                // Whether to proxy
+                let answers = match get_answer(&query.name, query.qtype).await {
+                    Some(record) => Vec::from([record]),
+                    None => {
+                        let ref mut v4_request = request.clone();
+                        v4_request.questions.get_mut(0).unwrap().qtype = QueryType::A;
+                        let ref mut buffer = BytePacketBuffer::new();
+                        v4_request.write(buffer)?;
+
+                        let response = proxy(&buffer.buf[..buffer.pos]).await?;
+                        let ref mut response_buffer = BytePacketBuffer::new();
+                        response_buffer.buf[..response.len()].copy_from_slice(&response);
+                        let response_packet = DnsPacket::from_buffer(response_buffer)?;
+                        response_packet.answers
+                    }
+                };
+                for answer in answers {
+                    request.answers.push(match answer {
+                        DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
+                            domain: domain,
+                            addr: addr.to_ipv6_mapped(),
+                            ttl: ttl,
+                        },
+                        _ => answer,
+                    });
+                }
+            }
+        }
+        RunMode::V6inV4 => {
+            if query.qtype == QueryType::A {
+                let ref mut v6_request = request.clone();
+                v6_request.questions.get_mut(0).unwrap().qtype = QueryType::AAAA;
+                let ref mut buffer = BytePacketBuffer::new();
+                v6_request.write(buffer)?;
+
+                let response = proxy(&buffer.buf[..buffer.pos]).await?;
+                let ref mut response_buffer = BytePacketBuffer::new();
+                response_buffer.buf[..response.len()].copy_from_slice(&response);
+                let ref mut response_packet = DnsPacket::from_buffer(response_buffer)?;
+                request.resources.append(&mut response_packet.answers)
+            }
+        }
+    }
 
     request.header.recursion_desired = true;
     request.header.recursion_available = true;
     request.header.response = true;
-    request.answers.push(answer);
     let mut res_buffer = BytePacketBuffer::new();
     request.write(&mut res_buffer)?;
-
     let data = res_buffer.get_range(0, res_buffer.pos())?;
     Ok(data.to_vec())
 }
