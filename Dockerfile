@@ -10,6 +10,6 @@ EXPOSE 53/udp
 WORKDIR /root
 COPY --from=builder ./root/target/release/updns .
 ENV LOG=info,warn,error
-CMD ["./updns"]
+ENTRYPOINT ["./updns"]
 
 
