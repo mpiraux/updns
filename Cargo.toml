@@ -30,3 +30,4 @@ lazy_static = "1.4.0"
 logs = "0.7.1"
 regex = "1.5.5"
 tokio = { version = "1.18.5", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time", "sync"] }
+rand = { version = "0.8.5", features = ["std_rng"] }
