@@ -15,11 +15,12 @@ pub enum RunMode {
     V6,
     V4inV6,
     V6inV4,
+    EXP3,
 }
 
 impl RunMode {
     fn values_str<'a>() -> &'a [&'a str] {
-        &["v4", "v6", "v4inv6", "v6inv4"]
+        &["v4", "v6", "v4inv6", "v6inv4", "exp3"]
     }
 
     fn from_str(s: &str) -> Result<Self, &str> {
@@ -28,6 +29,7 @@ impl RunMode {
             "v6" => Ok(RunMode::V6),
             "v4inv6" => Ok(RunMode::V4inV6),
             "v6inv4" => Ok(RunMode::V6inV4),
+            "exp3" => Ok(RunMode::EXP3),
             _ => Err("Unknown run mode"),
         }
     }
@@ -40,6 +42,7 @@ impl From<RunMode> for &str {
             RunMode::V6 => "v6",
             RunMode::V4inV6 => "v4inv6",
             RunMode::V6inV4 => "v6inv4",
+            RunMode::EXP3 => "exp3",
         }
     }
 }

@@ -124,6 +124,7 @@ impl Hosts {
 pub struct Config {
     pub bind: Vec<SocketAddr>,
     pub proxy: Vec<SocketAddr>,
+    pub feedback: Option<SocketAddr>,
     pub hosts: Hosts,
     pub timeout: Option<Duration>,
     pub invalid: Vec<Invalid>,
@@ -135,6 +136,7 @@ impl Config {
             hosts: Hosts::new(),
             bind: Vec::new(),
             proxy: Vec::new(),
+            feedback: None,
             invalid: Vec::new(),
             timeout: None,
         }
@@ -147,6 +149,9 @@ impl Config {
         self.invalid.extend(other.invalid);
         if other.timeout.is_some() {
             self.timeout = other.timeout;
+        }
+        if other.feedback.is_some() {
+            self.feedback = other.feedback;
         }
     }
 }
@@ -285,6 +290,10 @@ impl Parser {
                         }
                         config.extend(Parser::new(path).await?.parse().await?);
                     }
+                    "feedback" => match value.parse::<SocketAddr>() {
+                        Ok(addr) => config.feedback = Some(addr),
+                        Err(_) => invalid!(InvalidType::SocketAddr),
+                    },
                     _ => match Self::record(key, value) {
                         Ok(record) => config.hosts.push(record),
                         Err(kind) => invalid!(kind),
@@ -324,6 +333,11 @@ mod tests {
         assert_eq!(
             config.proxy,
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)]
+        );
+
+        assert_eq!(
+            config.feedback,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1234))
         );
 
         let ip_addresses: Vec<_> = config.hosts.record.iter().map(|(_, ip)| *ip).collect();

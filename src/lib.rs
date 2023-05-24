@@ -6,8 +6,15 @@
 
 pub mod exp3;
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+use exp3::EXP3;
+use logs::info;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 const MAX_BUFFER_SIZE: usize = 4096;
 
@@ -863,5 +870,125 @@ impl DnsPacket {
         }
 
         None
+    }
+}
+
+#[derive(Debug)]
+pub struct ConnectionTime {
+    domain: String,
+    ip_version: u8,
+    connection_time: u16,
+}
+
+impl ConnectionTime {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<Vec<ConnectionTime>> {
+        let ntimes = buffer.read()? as usize;
+        let mut feedback_times: Vec<ConnectionTime> = Vec::with_capacity(ntimes);
+        for _ in 0..ntimes {
+            let str_size = buffer.read()? as usize;
+            let domain =
+                String::from_utf8_lossy(&buffer.buf[buffer.pos()..buffer.pos() + str_size])
+                    .to_string();
+            buffer.step(str_size)?;
+            feedback_times.push(ConnectionTime {
+                domain,
+                ip_version: buffer.read()?,
+                connection_time: buffer.read_u16()?,
+            })
+        }
+        return Ok(feedback_times);
+    }
+}
+
+pub struct EXP3State {
+    rng: StdRng,
+    instances: HashMap<String, EXP3>,
+    history: HashMap<String, (Option<u16>, Option<u16>)>,
+}
+
+impl EXP3State {
+    pub fn new(seed: &str) -> EXP3State {
+        let mut bytes = [0u8; 32];
+        bytes[0..seed.len()].copy_from_slice(seed.as_bytes());
+        let rng = StdRng::from_seed(bytes);
+        EXP3State {
+            rng,
+            instances: HashMap::new(),
+            history: HashMap::new(),
+        }
+    }
+
+    fn get_root_domain(domain: String) -> String {
+        if domain.matches(".").count() < 2 {
+            domain
+        } else {
+            let s: Vec<&str> = domain.split(".").collect();
+            s[s.len() - 2..s.len()].join(".")
+        }
+    }
+
+    pub fn update_with(&mut self, feedback: Vec<ConnectionTime>) -> Result<()> {
+        for c in feedback {
+            let root_domain = EXP3State::get_root_domain(c.domain.clone());
+            info!(
+                "Connection to {}({})@v{} took {}ms",
+                c.domain, root_domain, c.ip_version, c.connection_time
+            );
+
+            let mut last_ctimes: (Option<u16>, Option<u16>) = match self.history.get(&root_domain) {
+                None => (None, None),
+                Some(x) => *x,
+            };
+
+            let action: usize = match c.ip_version {
+                4 => 0,
+                6 => 1,
+                _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown IP version")),
+            };
+
+            let reward = match (action, last_ctimes) {
+                (0, (_, Some(last_time))) | (1, (Some(last_time), _)) => {
+                    if c.connection_time < last_time {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+
+            match c.ip_version {
+                4 => last_ctimes.0 = Some(c.connection_time),
+                6 => last_ctimes.1 = Some(c.connection_time),
+                _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown IP version")),
+            }
+            self.history.insert(root_domain.to_owned(), last_ctimes);
+
+            match self.instances.get_mut(&root_domain) {
+                Some(instance) => instance.give_reward(action, reward),
+                None => assert!(reward == 0.0),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn choose_query_type(&mut self, domain: String) -> Result<QueryType> {
+        let root_domain = EXP3State::get_root_domain(domain);
+        if !self.instances.contains_key(&root_domain) {
+            let instance = EXP3::new(2, 0.1, true, false);
+            self.instances.insert(root_domain.to_owned(), instance);
+        }
+        let instance = self.instances.get_mut(&root_domain).unwrap();
+        let action = instance.take_action(&mut self.rng);
+        info!(
+            "EXP3 took action {} for root domain {}",
+            action, root_domain
+        );
+        info!("EXP3 state {:?}", instance.history.last());
+        Ok(match action {
+            0 => QueryType::A,
+            1 => QueryType::AAAA,
+            _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown action")),
+        })
     }
 }

@@ -1,6 +1,7 @@
 bind     0.0.0.0:53      # Binding address
 proxy    8.8.8.8:53      # Proxy address
 timeout  2s              # Proxy timeout (format: 1ms, 1s, 1m, 1h, 1d)
+feedback 0.0.0.0:1234
 
 # Domain matching
 example.com              1.1.1.1

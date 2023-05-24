@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{Error, ErrorKind, Result},
+    io::{self, Error, ErrorKind, Result},
     net::UdpSocket,
     sync::RwLock,
     time::timeout,
@@ -29,11 +29,13 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(5000);
 const DEFAULT_BIND: &str = "0.0.0.0:53";
 const DEFAULT_PROXY: [&str; 2] = ["8.8.8.8:53", "1.1.1.1:53"];
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
+const DEFAULT_FEEDBACK_BIND: &str = "0.0.0.0:50000";
 
 lazy_static! {
     static ref PROXY: RwLock<Vec<SocketAddr>> = RwLock::new(Vec::new());
     static ref HOSTS: RwLock<Hosts> = RwLock::new(Hosts::new());
     static ref TIMEOUT: RwLock<Duration> = RwLock::new(DEFAULT_TIMEOUT);
+    static ref FEEDBACK: RwLock<Option<SocketAddr>> = RwLock::new(None);
 }
 
 #[macro_export]
@@ -102,12 +104,19 @@ async fn main() {
                     DEFAULT_PROXY.join(", ")
                 );
             }
+            if config.feedback.is_none() {
+                warn!(
+                    "Will bind the default feedback address '{}'",
+                    DEFAULT_FEEDBACK_BIND
+                );
+                config.feedback = Some(DEFAULT_FEEDBACK_BIND.parse().unwrap());
+            }
 
-            update_config(config.proxy, config.hosts, config.timeout).await;
+            update_config(config.proxy, config.hosts, config.timeout, config.feedback).await;
 
             // Run server
             for addr in config.bind {
-                tokio::spawn(run_server(addr, mode));
+                tokio::spawn(run_server(addr, config.feedback.unwrap(), mode)); // TODO(mp): I've likely broken the threading model
             }
             // watch config
             watch_config(path, WATCH_INTERVAL).await;
@@ -115,7 +124,12 @@ async fn main() {
     }
 }
 
-async fn update_config(mut proxy: Vec<SocketAddr>, hosts: Hosts, timeout: Option<Duration>) {
+async fn update_config(
+    mut proxy: Vec<SocketAddr>,
+    hosts: Hosts,
+    timeout: Option<Duration>,
+    feedback: Option<SocketAddr>,
+) {
     if proxy.is_empty() {
         proxy = DEFAULT_PROXY
             .iter()
@@ -134,6 +148,10 @@ async fn update_config(mut proxy: Vec<SocketAddr>, hosts: Hosts, timeout: Option
     {
         let mut w = TIMEOUT.write().await;
         *w = timeout.unwrap_or(DEFAULT_TIMEOUT);
+    }
+    {
+        let mut w = FEEDBACK.write().await;
+        *w = Some(feedback.unwrap_or(DEFAULT_FEEDBACK_BIND.parse().unwrap()));
     }
 }
 
@@ -157,14 +175,14 @@ async fn watch_config(p: PathBuf, d: Duration) {
         info!("Reload the configuration file: {:?}", &p);
         if let Ok(parser) = Parser::new(&p).await {
             if let Ok(config) = parser.parse().await {
-                update_config(config.proxy, config.hosts, config.timeout).await;
+                update_config(config.proxy, config.hosts, config.timeout, config.feedback).await;
                 config.invalid.print();
             }
         }
     }
 }
 
-async fn run_server(addr: SocketAddr, mode: RunMode) {
+async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) {
     let socket = match UdpSocket::bind(&addr).await {
         Ok(socket) => {
             info!("Start listening to '{}'", addr);
@@ -175,27 +193,60 @@ async fn run_server(addr: SocketAddr, mode: RunMode) {
         }
     };
 
+    let feedback_socket = match UdpSocket::bind(&feedback_addr).await {
+        Ok(socket) => {
+            info!("Start listening for feedback on '{}'", feedback_addr);
+            socket
+        }
+        Err(err) => {
+            exit!("Binding '{}' failed\n{:?}", feedback_addr, err)
+        }
+    };
+    let mut exp3_state = EXP3State::new("test");
+
     loop {
         let mut req = BytePacketBuffer::new();
 
-        let (len, src) = match socket.recv_from(&mut req.buf).await {
-            Ok(r) => r,
-            Err(err) => {
-                error!("Failed to receive message {:?}", err);
-                continue;
-            }
-        };
+        tokio::select! {
+            _ = socket.readable() => {
+                let (len, src) = match socket.try_recv_from(&mut req.buf) {
+                    Ok(r) => r,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("Failed to receive message {:?}", err);
+                        continue;
+                    }
+                };
 
-        let res = match handle(req, len, mode).await {
-            Ok(data) => data,
-            Err(err) => {
-                error!("Processing request failed {:?}", err);
-                continue;
-            }
-        };
+                let res = match handle_request(req, len, mode, &mut exp3_state).await {
+                    Ok(data) => data,
+                    Err(err) => {
+                        error!("Processing request failed {:?}", err);
+                        continue;
+                    }
+                };
 
-        if let Err(err) = socket.send_to(&res, &src).await {
-            error!("Replying to '{}' failed {:?}", &src, err);
+                if let Err(err) = socket.send_to(&res, &src).await {
+                    error!("Replying to '{}' failed {:?}", &src, err);
+                }
+            }
+            _ = feedback_socket.readable() => {
+                let len = match feedback_socket.try_recv(&mut req.buf) {
+                    Ok(r) => r,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("Failed to receive message {:?}", err);
+                        continue;
+                    }
+                };
+                if let Err(err) = handle_feedback(req, len, &mut exp3_state).await {
+                    error!("Unable to parse feedback {:?}", err);
+                }
+            }
         }
     }
 }
@@ -258,7 +309,12 @@ async fn get_answer(domain: &str, query: QueryType) -> Option<DnsRecord> {
     None
 }
 
-async fn handle(mut req: BytePacketBuffer, len: usize, mode: RunMode) -> Result<Vec<u8>> {
+async fn handle_request(
+    mut req: BytePacketBuffer,
+    len: usize,
+    mode: RunMode,
+    exp3_state: &mut EXP3State,
+) -> Result<Vec<u8>> {
     let mut request = DnsPacket::from_buffer(&mut req)?;
     assert!(request.questions.len() < 2);
 
@@ -324,6 +380,43 @@ async fn handle(mut req: BytePacketBuffer, len: usize, mode: RunMode) -> Result<
                 request.resources.append(&mut response_packet.answers)
             }
         }
+        RunMode::EXP3 => {
+            if query.qtype == QueryType::AAAA {
+                let domain = request.questions.get(0).unwrap().name.to_owned();
+                let query_type = exp3_state.choose_query_type(domain)?;
+                let answers = match query_type {
+                    QueryType::A => {
+                        let ref mut v4_request = request.clone();
+                        v4_request.questions.get_mut(0).unwrap().qtype = QueryType::A;
+                        let ref mut buffer = BytePacketBuffer::new();
+                        v4_request.write(buffer)?;
+
+                        let response = proxy(&buffer.buf[..buffer.pos]).await?;
+                        let ref mut response_buffer = BytePacketBuffer::new();
+                        response_buffer.buf[..response.len()].copy_from_slice(&response);
+                        let response_packet = DnsPacket::from_buffer(response_buffer)?;
+                        response_packet.answers
+                    }
+                    QueryType::AAAA => return proxy(&req.buf[..len]).await,
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::Unsupported,
+                            "Unsupported query type returned by EXP3",
+                        ))
+                    }
+                };
+                for answer in answers {
+                    request.answers.push(match answer {
+                        DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
+                            domain: domain,
+                            addr: addr.to_ipv6_mapped(),
+                            ttl: ttl,
+                        },
+                        _ => answer,
+                    });
+                }
+            }
+        }
     }
 
     request.header.recursion_desired = true;
@@ -333,4 +426,20 @@ async fn handle(mut req: BytePacketBuffer, len: usize, mode: RunMode) -> Result<
     request.write(&mut res_buffer)?;
     let data = res_buffer.get_range(0, res_buffer.pos())?;
     Ok(data.to_vec())
+}
+
+async fn handle_feedback(
+    mut req: BytePacketBuffer,
+    len: usize,
+    exp3_state: &mut EXP3State,
+) -> Result<()> {
+    let feedback = ConnectionTime::read(&mut req)?;
+    if req.pos() == len {
+        exp3_state.update_with(feedback)
+    } else {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            "Bytes left after reading",
+        ))
+    }
 }
