@@ -325,18 +325,19 @@ async fn handle_request(
 
     info!("{} {:?}", query.name, query.qtype);
 
-    match mode {
-        RunMode::V4 => {
+    match (mode, query.qtype) {
+        (_, QueryType::UNKNOWN(65)) => {},
+        (RunMode::V4, _) => {
             if query.qtype != QueryType::AAAA {
                 return proxy(&req.buf[..len]).await;
             }
         }
-        RunMode::V6 => {
+        (RunMode::V6, _) => {
             if query.qtype != QueryType::A {
                 return proxy(&req.buf[..len]).await;
             }
         }
-        RunMode::V4inV6 => {
+        (RunMode::V4inV6, _) => {
             if query.qtype != QueryType::A {
                 // Whether to proxy
                 let answers = match get_answer(&query.name, query.qtype).await {
@@ -366,7 +367,7 @@ async fn handle_request(
                 }
             }
         }
-        RunMode::V6inV4 => {
+        (RunMode::V6inV4, _) => {
             if query.qtype == QueryType::A {
                 let ref mut v6_request = request.clone();
                 v6_request.questions.get_mut(0).unwrap().qtype = QueryType::AAAA;
@@ -380,31 +381,32 @@ async fn handle_request(
                 request.resources.append(&mut response_packet.answers)
             }
         }
-        RunMode::EXP3 => {
-            if query.qtype == QueryType::AAAA {
-                let domain = request.questions.get(0).unwrap().name.to_owned();
-                let query_type = exp3_state.choose_query_type(domain)?;
-                let answers = match query_type {
-                    QueryType::A => {
-                        let ref mut v4_request = request.clone();
-                        v4_request.questions.get_mut(0).unwrap().qtype = QueryType::A;
-                        let ref mut buffer = BytePacketBuffer::new();
-                        v4_request.write(buffer)?;
-
-                        let response = proxy(&buffer.buf[..buffer.pos]).await?;
-                        let ref mut response_buffer = BytePacketBuffer::new();
-                        response_buffer.buf[..response.len()].copy_from_slice(&response);
-                        let response_packet = DnsPacket::from_buffer(response_buffer)?;
-                        response_packet.answers
+        (RunMode::EXP3, _) => {
+            let domain = request.questions.get(0).unwrap().name.to_owned();
+            if query.qtype == QueryType::A || query.qtype == QueryType::AAAA {
+                if exp3_state.retrieve_cache(&domain, query.qtype).is_empty() {
+                    let response = proxy(&req.buf[0..len]).await?;
+                    let ref mut response_buffer = BytePacketBuffer::new();
+                    response_buffer.buf[..response.len()].copy_from_slice(&response);
+                    for a in DnsPacket::from_buffer(response_buffer)?.answers {
+                        exp3_state.insert_in_cache(a);
                     }
-                    QueryType::AAAA => return proxy(&req.buf[..len]).await,
-                    _ => {
-                        return Err(Error::new(
-                            ErrorKind::Unsupported,
-                            "Unsupported query type returned by EXP3",
-                        ))
-                    }
-                };
+                }
+            }
+            if (query.qtype == QueryType::A
+                && exp3_state
+                    .retrieve_cache(&domain, QueryType::AAAA)
+                    .is_empty())
+                || (query.qtype == QueryType::AAAA
+                    && exp3_state.retrieve_cache(&domain, QueryType::A).is_empty())
+            {
+                for r in exp3_state.retrieve_cache(&domain, query.qtype) {
+                    request.answers.push(r);
+                }
+            }
+            if request.answers.len() == 0 && query.qtype == QueryType::AAAA {
+                let query_type = exp3_state.choose_query_type(&domain)?;
+                let answers = exp3_state.retrieve_cache(&domain, query_type);
                 for answer in answers {
                     request.answers.push(match answer {
                         DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {

@@ -8,6 +8,7 @@ pub struct EXP3Round {
     pub probabilities: Vec<f64>,
     pub action: usize,
     pub reward: f64,
+    pub round: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -87,13 +88,14 @@ impl EXP3 {
             *w = f64::max(1.0, *w)
         }
 
-        self.round += 1;
         self.waiting_reward = false;
         self.history.push(EXP3Round {
             weights: self.weights.clone(),
             probabilities: self.probabilities(),
             action,
             reward,
+            round: self.round,
         });
+        self.round += 1;
     }
 }

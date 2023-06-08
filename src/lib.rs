@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{Error, ErrorKind, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::{Duration, Instant};
+use std::vec;
 
 use exp3::EXP3;
 use logs::info;
@@ -720,6 +722,43 @@ impl DnsRecord {
 
         Ok(buffer.pos() - start_pos)
     }
+
+    pub fn get_ttl(&self) -> u32 {
+        *match self {
+            DnsRecord::UNKNOWN { ttl, .. } => ttl,
+            DnsRecord::A { ttl, .. } => ttl,
+            DnsRecord::NS { ttl, .. } => ttl,
+            DnsRecord::CNAME { ttl, .. } => ttl,
+            DnsRecord::SOA { ttl, .. } => ttl,
+            DnsRecord::MX { ttl, .. } => ttl,
+            DnsRecord::AAAA { ttl, .. } => ttl,
+        }
+    }
+
+    pub fn set_ttl(&mut self, new_ttl: u32) {
+        (*match self {
+            DnsRecord::UNKNOWN { ttl, .. } => ttl,
+            DnsRecord::A { ttl, .. } => ttl,
+            DnsRecord::NS { ttl, .. } => ttl,
+            DnsRecord::CNAME { ttl, .. } => ttl,
+            DnsRecord::SOA { ttl, .. } => ttl,
+            DnsRecord::MX { ttl, .. } => ttl,
+            DnsRecord::AAAA { ttl, .. } => ttl,
+        }) = new_ttl;
+    }
+
+    pub fn get_domain(&self) -> String {
+        (*match self {
+            DnsRecord::UNKNOWN { domain, .. } => domain,
+            DnsRecord::A { domain, .. } => domain,
+            DnsRecord::NS { domain, .. } => domain,
+            DnsRecord::CNAME { domain, .. } => domain,
+            DnsRecord::SOA { domain, .. } => domain,
+            DnsRecord::MX { domain, .. } => domain,
+            DnsRecord::AAAA { domain, .. } => domain,
+        })
+        .clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -900,10 +939,17 @@ impl ConnectionTime {
     }
 }
 
+#[derive(Debug)]
+pub struct CachedRecord {
+    pub record: DnsRecord,
+    pub expiration: Instant,
+}
+
 pub struct EXP3State {
     rng: StdRng,
     instances: HashMap<String, EXP3>,
     history: HashMap<String, (Option<u16>, Option<u16>)>,
+    cache: HashMap<String, Vec<CachedRecord>>,
 }
 
 impl EXP3State {
@@ -915,12 +961,13 @@ impl EXP3State {
             rng,
             instances: HashMap::new(),
             history: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
 
-    fn get_root_domain(domain: String) -> String {
+    fn get_root_domain(domain: &String) -> String {
         if domain.matches(".").count() < 2 {
-            domain
+            domain.to_string()
         } else {
             let s: Vec<&str> = domain.split(".").collect();
             s[s.len() - 2..s.len()].join(".")
@@ -929,7 +976,7 @@ impl EXP3State {
 
     pub fn update_with(&mut self, feedback: Vec<ConnectionTime>) -> Result<()> {
         for c in feedback {
-            let root_domain = EXP3State::get_root_domain(c.domain.clone());
+            let root_domain = EXP3State::get_root_domain(&c.domain);
             info!(
                 "Connection to {}({})@v{} took {}ms",
                 c.domain, root_domain, c.ip_version, c.connection_time
@@ -965,14 +1012,17 @@ impl EXP3State {
             self.history.insert(root_domain.to_owned(), last_ctimes);
 
             match self.instances.get_mut(&root_domain) {
-                Some(instance) => instance.give_reward(action, reward),
-                None => assert!(reward == 0.0),
+                Some(instance) => {
+                    instance.give_reward(action, reward);
+                    info!("EXP3 state {:?}", instance.history.last());
+                },
+                None => {} //assert!(reward == 0.0),
             }
         }
         Ok(())
     }
 
-    pub fn choose_query_type(&mut self, domain: String) -> Result<QueryType> {
+    pub fn choose_query_type(&mut self, domain: &String) -> Result<QueryType> {
         let root_domain = EXP3State::get_root_domain(domain);
         if !self.instances.contains_key(&root_domain) {
             let instance = EXP3::new(2, 0.1, true, false);
@@ -990,5 +1040,72 @@ impl EXP3State {
             1 => QueryType::AAAA,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown action")),
         })
+    }
+
+    pub fn insert_in_cache(&mut self, record: DnsRecord) {
+        if let DnsRecord::UNKNOWN { .. } = record {
+            return;
+        }
+        let domain = record.get_domain();
+        let v = match self.cache.get_mut(&domain) {
+            Some(v) => v,
+            None => {
+                let v = Vec::new();
+                self.cache.insert(domain.clone(), v);
+                self.cache.get_mut(&domain).unwrap()
+            }
+        };
+
+        let expiration = Instant::now() + Duration::new(record.get_ttl().into(), 0);
+        v.push(CachedRecord { record, expiration });
+    }
+
+    pub fn retrieve_cache(&mut self, domain: &String, query_type: QueryType) -> Vec<DnsRecord> { // TODO: Extend it to return all records matching the query
+        let now = Instant::now();
+        let cr = match self.cache.get_mut(domain) {
+            Some(v) => {
+                v.retain(|c| c.expiration > now);
+                let cr = v.iter().find(|c| match (query_type, c.record.clone()) {
+                    (QueryType::A, DnsRecord::A { .. })
+                    | (QueryType::AAAA, DnsRecord::AAAA { .. })
+                    | (QueryType::CNAME, DnsRecord::CNAME { .. })
+                    | (QueryType::MX, DnsRecord::MX { .. })
+                    | (QueryType::NS, DnsRecord::NS { .. })
+                    | (QueryType::SOA, DnsRecord::SOA { .. }) => true,
+                    _ => false,
+                });
+                if cr.is_none() {
+                    v.iter().find(|c| match (query_type, c.record.clone()) {
+                        (QueryType::A, DnsRecord::CNAME { .. })
+                        | (QueryType::AAAA, DnsRecord::CNAME { .. }) => true,
+                        _ => false,
+                    })
+                } else {
+                    cr
+                }
+            }
+            None => None,
+        };
+        if let Some(cr) = cr {
+            match cr.record.clone() {
+                mut r => {
+                    r.set_ttl((cr.expiration - now).as_secs() as u32);
+                    return match &r {
+                        DnsRecord::CNAME { host, .. } => {
+                            let alias = &mut self.retrieve_cache(host, query_type);
+                            if !alias.is_empty() {
+                                let mut v = vec![r.to_owned()];
+                                v.append(alias);
+                                v
+                            } else {
+                                vec![]
+                            }
+                        },
+                        r => vec![r.to_owned()]
+                    }
+                }
+            };
+        }
+        vec![]
     }
 }
