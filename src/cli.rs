@@ -9,27 +9,39 @@ pub struct Args {
     pub run: RunType,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
+    Normal,
     V4,
+    DelayV4,
     V6,
+    DelayV6,
+    V6AddV4,
     V4inV6,
+    V4inV6AddV6,
     V6inV4,
     EXP3,
+    Test,
 }
 
 impl RunMode {
     fn values_str<'a>() -> &'a [&'a str] {
-        &["v4", "v6", "v4inv6", "v6inv4", "exp3"]
+        &["normal", "v4", "delayv4", "v6", "delayv6", "v6addv4", "v4inv6", "v4inv6addv6", "v6inv4", "exp3", "test"]
     }
 
     fn from_str(s: &str) -> Result<Self, &str> {
         match s.to_lowercase().as_str() {
+            "normal" => Ok(RunMode::Normal),
             "v4" => Ok(RunMode::V4),
+            "delayv4" => Ok(RunMode::DelayV4),
+            "delayv6" => Ok(RunMode::DelayV6),
             "v6" => Ok(RunMode::V6),
+            "v6addv4" => Ok(RunMode::V6AddV4),
             "v4inv6" => Ok(RunMode::V4inV6),
+            "v4inv6addv6" => Ok(RunMode::V4inV6AddV6),
             "v6inv4" => Ok(RunMode::V6inV4),
             "exp3" => Ok(RunMode::EXP3),
+            "test" => Ok(RunMode::Test),
             _ => Err("Unknown run mode"),
         }
     }
@@ -38,11 +50,17 @@ impl RunMode {
 impl From<RunMode> for &str {
     fn from(value: RunMode) -> Self {
         match value {
+            RunMode::Normal => "normal",
             RunMode::V4 => "v4",
+            RunMode::DelayV4 => "delayv4",
             RunMode::V6 => "v6",
+            RunMode::DelayV6 => "delayv6",
+            RunMode::V6AddV4 => "v6addv4",
             RunMode::V4inV6 => "v4inv6",
+            RunMode::V4inV6AddV6 => "v4inv6addv6",
             RunMode::V6inV4 => "v6inv4",
             RunMode::EXP3 => "exp3",
+            RunMode::Test => "test",
         }
     }
 }

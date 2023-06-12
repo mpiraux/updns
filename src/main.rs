@@ -13,13 +13,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::Duration, collections::{HashMap, BinaryHeap}, cmp::Reverse,
 };
 use tokio::{
     io::{self, Error, ErrorKind, Result},
     net::UdpSocket,
     sync::RwLock,
-    time::timeout,
+    time::{timeout, Instant, sleep_until},
 };
 use updns::*;
 use watch::Watch;
@@ -203,9 +203,14 @@ async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) 
         }
     };
     let mut exp3_state = EXP3State::new("test");
+    let mut pending_responses: HashMap<Instant, (SocketAddr, Vec<u8>)> = HashMap::new();
+    let mut pending_timers: BinaryHeap<Reverse<Instant>> = BinaryHeap::new();
 
     loop {
         let mut req = BytePacketBuffer::new();
+
+        let max_timer = Instant::now() + Duration::from_secs(86400 * 365);
+        let next_timer = pending_timers.peek().unwrap_or(&Reverse(max_timer)).0;
 
         tokio::select! {
             _ = socket.readable() => {
@@ -220,7 +225,7 @@ async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) 
                     }
                 };
 
-                let res = match handle_request(req, len, mode, &mut exp3_state).await {
+                let (it, res) = match handle_request(req, len, mode, &mut exp3_state).await {
                     Ok(data) => data,
                     Err(err) => {
                         error!("Processing request failed {:?}", err);
@@ -228,9 +233,8 @@ async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) 
                     }
                 };
 
-                if let Err(err) = socket.send_to(&res, &src).await {
-                    error!("Replying to '{}' failed {:?}", &src, err);
-                }
+                pending_timers.push(Reverse(it.clone()));
+                pending_responses.insert(it, (src, res));
             }
             _ = feedback_socket.readable() => {
                 let len = match feedback_socket.try_recv(&mut req.buf) {
@@ -247,11 +251,21 @@ async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) 
                     error!("Unable to parse feedback {:?}", err);
                 }
             }
+            _ = sleep_until(next_timer.clone()) => {
+                if next_timer != max_timer {
+                    let (src, res) = pending_responses.remove(&next_timer).unwrap();
+                    if let Err(err) = socket.send_to(&res, &src).await {
+                        error!("Replying to '{}' failed {:?}", &src, err);
+                    }
+                    pending_timers.pop();
+                }
+            }
         }
     }
 }
 
-async fn proxy(buf: &[u8]) -> Result<Vec<u8>> {
+async fn proxy(buf: &[u8]) -> Result<(Instant, Vec<u8>)> {
+    let now = Instant::now();
     let proxy = PROXY.read().await;
     let duration = *TIMEOUT.read().await;
 
@@ -268,7 +282,7 @@ async fn proxy(buf: &[u8]) -> Result<Vec<u8>> {
 
         match data {
             Ok(data) => {
-                return Ok(data);
+                return Ok((now, data));
             }
             Err(err) => {
                 error!("Agent request to {} {:?}", addr, err);
@@ -314,7 +328,8 @@ async fn handle_request(
     len: usize,
     mode: RunMode,
     exp3_state: &mut EXP3State,
-) -> Result<Vec<u8>> {
+) -> Result<(Instant, Vec<u8>)> {
+    let mut it = Instant::now();
     let mut request = DnsPacket::from_buffer(&mut req)?;
     assert!(request.questions.len() < 2);
 
@@ -327,17 +342,47 @@ async fn handle_request(
 
     match (mode, query.qtype) {
         (_, QueryType::UNKNOWN(65)) => {},
-        (RunMode::V4, _) => {
-            if query.qtype != QueryType::AAAA {
-                return proxy(&req.buf[..len]).await;
-            }
-        }
+        (RunMode::Normal, _) => return proxy(&req.buf[..len]).await,
+        (RunMode::V4, QueryType::AAAA) => {},
+        (RunMode::V4, _) => return proxy(&req.buf[..len]).await,
+        (RunMode::DelayV4, QueryType::A) => return Ok((it.checked_add(Duration::from_millis(20)).unwrap(), (proxy(&req.buf[..len]).await)?.1)),
+        (RunMode::DelayV4, _) => return proxy(&req.buf[..len]).await,
         (RunMode::V6, _) => {
             if query.qtype != QueryType::A {
                 return proxy(&req.buf[..len]).await;
             }
         }
-        (RunMode::V4inV6, _) => {
+        (RunMode::DelayV6, QueryType::AAAA) => return Ok((it.checked_add(Duration::from_millis(20)).unwrap(), (proxy(&req.buf[..len]).await)?.1)),
+        (RunMode::DelayV6, _) => return proxy(&req.buf[..len]).await,
+        (RunMode::V6AddV4, _) => {
+            let domain = request.questions.get(0).unwrap().name.to_owned();
+            if query.qtype == QueryType::A || query.qtype == QueryType::AAAA {
+                if exp3_state.retrieve_cache(&domain, query.qtype).is_empty() {
+                    let (_, response) = proxy(&req.buf[0..len]).await?;
+                    let ref mut response_buffer = BytePacketBuffer::new();
+                    response_buffer.buf[..response.len()].copy_from_slice(&response);
+                    for a in DnsPacket::from_buffer(response_buffer)?.answers {
+                        exp3_state.insert_in_cache(a);
+                    }
+                }
+            }
+            if query.qtype == QueryType::AAAA {
+                for r in exp3_state.retrieve_cache(&domain, query.qtype) {
+                    request.answers.push(r);
+                }
+                for r in exp3_state.retrieve_cache(&domain, QueryType::A) {
+                    request.resources.push(match r {
+                        DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
+                            domain,
+                            addr: addr.to_ipv6_mapped(),
+                            ttl,
+                        },
+                        _ => r,
+                    });
+                }
+            }
+        },
+        (RunMode::V4inV6, _) | (RunMode::V4inV6AddV6, _) => {
             if query.qtype != QueryType::A {
                 // Whether to proxy
                 let answers = match get_answer(&query.name, query.qtype).await {
@@ -348,7 +393,7 @@ async fn handle_request(
                         let ref mut buffer = BytePacketBuffer::new();
                         v4_request.write(buffer)?;
 
-                        let response = proxy(&buffer.buf[..buffer.pos]).await?;
+                        let (_, response) = proxy(&buffer.buf[..buffer.pos]).await?;
                         let ref mut response_buffer = BytePacketBuffer::new();
                         response_buffer.buf[..response.len()].copy_from_slice(&response);
                         let response_packet = DnsPacket::from_buffer(response_buffer)?;
@@ -358,13 +403,33 @@ async fn handle_request(
                 for answer in answers {
                     request.answers.push(match answer {
                         DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
-                            domain: domain,
+                            domain,
                             addr: addr.to_ipv6_mapped(),
-                            ttl: ttl,
+                            ttl,
                         },
                         _ => answer,
                     });
                 }
+            } else if mode == RunMode::V4inV6AddV6 {
+                let answers = match get_answer(&query.name, QueryType::AAAA).await {
+                    Some(record) => Vec::from([record]),
+                    None => {
+                        let ref mut v6_request = request.clone();
+                        v6_request.questions.get_mut(0).unwrap().qtype = QueryType::AAAA;
+                        let ref mut buffer = BytePacketBuffer::new();
+                        v6_request.write(buffer)?;
+
+                        let (_, response) = proxy(&buffer.buf[..buffer.pos]).await?;
+                        let ref mut response_buffer = BytePacketBuffer::new();
+                        response_buffer.buf[..response.len()].copy_from_slice(&response);
+                        let response_packet = DnsPacket::from_buffer(response_buffer)?;
+                        response_packet.answers
+                    }
+                };
+                for answer in answers {
+                    request.answers.push(answer);
+                }
+                it = Instant::now().checked_add(Duration::from_millis(40)).unwrap();
             }
         }
         (RunMode::V6inV4, _) => {
@@ -374,7 +439,7 @@ async fn handle_request(
                 let ref mut buffer = BytePacketBuffer::new();
                 v6_request.write(buffer)?;
 
-                let response = proxy(&buffer.buf[..buffer.pos]).await?;
+                let (_, response) = proxy(&buffer.buf[..buffer.pos]).await?;
                 let ref mut response_buffer = BytePacketBuffer::new();
                 response_buffer.buf[..response.len()].copy_from_slice(&response);
                 let ref mut response_packet = DnsPacket::from_buffer(response_buffer)?;
@@ -385,7 +450,7 @@ async fn handle_request(
             let domain = request.questions.get(0).unwrap().name.to_owned();
             if query.qtype == QueryType::A || query.qtype == QueryType::AAAA {
                 if exp3_state.retrieve_cache(&domain, query.qtype).is_empty() {
-                    let response = proxy(&req.buf[0..len]).await?;
+                    let (_, response) = proxy(&req.buf[0..len]).await?;
                     let ref mut response_buffer = BytePacketBuffer::new();
                     response_buffer.buf[..response.len()].copy_from_slice(&response);
                     for a in DnsPacket::from_buffer(response_buffer)?.answers {
@@ -410,13 +475,47 @@ async fn handle_request(
                 for answer in answers {
                     request.answers.push(match answer {
                         DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
-                            domain: domain,
+                            domain,
                             addr: addr.to_ipv6_mapped(),
-                            ttl: ttl,
+                            ttl,
                         },
                         _ => answer,
                     });
                 }
+            }
+        },
+        (RunMode::Test, _) => {
+            let answers = match get_answer(&query.name, query.qtype).await {
+                Some(record) => Vec::from([record]),
+                None => {
+                    let ref mut other_request = request.clone();
+                    other_request.questions.get_mut(0).unwrap().qtype = if query.qtype == QueryType::A {
+                        QueryType::AAAA
+                    } else {
+                        QueryType::A
+                    };
+                    let ref mut buffer = BytePacketBuffer::new();
+                    other_request.write(buffer)?;
+
+                    let (_, response) = proxy(&buffer.buf[..buffer.pos]).await?;
+                    let ref mut response_buffer = BytePacketBuffer::new();
+                    response_buffer.buf[..response.len()].copy_from_slice(&response);
+                    let response_packet = DnsPacket::from_buffer(response_buffer)?;
+                    response_packet.answers
+                }
+            };
+            for answer in answers {
+                request.answers.push(match answer {
+                    DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
+                        domain,
+                        addr: addr.to_ipv6_mapped(),
+                        ttl,
+                    },
+                    _ => answer,
+                });
+            }
+            if query.qtype == QueryType::A {
+                it = Instant::now().checked_add(Duration::from_millis(20)).unwrap();
             }
         }
     }
@@ -427,7 +526,7 @@ async fn handle_request(
     let mut res_buffer = BytePacketBuffer::new();
     request.write(&mut res_buffer)?;
     let data = res_buffer.get_range(0, res_buffer.pos())?;
-    Ok(data.to_vec())
+    Ok((it, data.to_vec()))
 }
 
 async fn handle_feedback(
