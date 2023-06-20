@@ -9,7 +9,7 @@ pub mod exp3;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::{Error, ErrorKind, Result};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use std::vec;
 
@@ -175,7 +175,7 @@ impl BytePacketBuffer {
 
         for label in split_str {
             let len = label.len();
-            if len > 0x34 {
+            if len > 0x3F {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     "Single label exceeds 63 characters of length",
@@ -945,23 +945,38 @@ pub struct CachedRecord {
     pub expiration: Instant,
 }
 
+#[derive(Debug)]
+pub struct EXP3Decision {
+    pub domain: String,
+    pub resolver: SocketAddr,
+    pub version: u8,
+    pub addresses: Vec<IpAddr>,
+    pub instant: Instant,
+}
+
 pub struct EXP3State {
     rng: StdRng,
+    pub resolvers: Vec<SocketAddr>,
+    pub no_queries_type: usize,
     instances: HashMap<String, EXP3>,
-    history: HashMap<String, (Option<u16>, Option<u16>)>,
-    cache: HashMap<String, Vec<CachedRecord>>,
+    history: HashMap<String, HashMap<(SocketAddr, u8), u16>>,
+    cache: HashMap<(SocketAddr, String), Vec<CachedRecord>>,
+    pub decisions: HashMap<String, EXP3Decision>,
 }
 
 impl EXP3State {
-    pub fn new(seed: &str) -> EXP3State {
+    pub fn new(seed: &str, resolvers: Vec<SocketAddr>, no_queries_type: usize) -> EXP3State {
         let mut bytes = [0u8; 32];
         bytes[0..seed.len()].copy_from_slice(seed.as_bytes());
         let rng = StdRng::from_seed(bytes);
         EXP3State {
             rng,
+            resolvers,
+            no_queries_type,
             instances: HashMap::new(),
             history: HashMap::new(),
             cache: HashMap::new(),
+            decisions: HashMap::new(),
         }
     }
 
@@ -982,50 +997,80 @@ impl EXP3State {
                 c.domain, root_domain, c.ip_version, c.connection_time
             );
 
-            let mut last_ctimes: (Option<u16>, Option<u16>) = match self.history.get(&root_domain) {
-                None => (None, None),
-                Some(x) => *x,
-            };
+            let last_decision = self.decisions.get(&c.domain);
+            if last_decision.is_none() {
+                continue;
+            }
+            let last_decision = last_decision.unwrap();
+            if c.ip_version != last_decision.version {
+                continue;
+            }
 
-            let action: usize = match c.ip_version {
-                4 => 0,
-                6 => 1,
-                _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown IP version")),
-            };
+            let action = self
+                .resolvers
+                .iter()
+                .position(|s| s == &last_decision.resolver)
+                .unwrap()
+                * self.no_queries_type
+                + match last_decision.version {
+                    4 => 0,
+                    6 => 1,
+                    _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown IP version")),
+                };
 
-            let reward = match (action, last_ctimes) {
-                (0, (_, Some(last_time))) | (1, (Some(last_time), _)) => {
-                    if c.connection_time < last_time {
-                        1.0
-                    } else {
-                        0.0
+            let last_ctimes = self.history.get_mut(&root_domain);
+            let mut better = false;
+            if let Some(v) = last_ctimes {
+                if ((v.len() == (self.resolvers.len() * self.no_queries_type) - 1)
+                    && !v.contains_key(&(last_decision.resolver.clone(), c.ip_version)))
+                    || v.len() == self.resolvers.len() * self.no_queries_type
+                {
+                    better = true;
+                    for ((resolver, version), ct) in v.iter() {
+                        if resolver != &last_decision.resolver && version != &last_decision.version
+                        {
+                            if c.connection_time > *ct {
+                                better = false;
+                                break;
+                            }
+                        }
                     }
                 }
-                _ => 0.0,
+                v.insert(
+                    (last_decision.resolver.clone(), c.ip_version),
+                    c.connection_time,
+                );
+            } else {
+                let mut v: HashMap<(SocketAddr, u8), u16> = HashMap::new();
+                v.insert(
+                    (last_decision.resolver.clone(), c.ip_version),
+                    c.connection_time,
+                );
+                self.history.insert(root_domain.to_owned(), v);
+            }
+
+            let reward = match better {
+                true => 1.0,
+                false => 0.0,
             };
 
-            match c.ip_version {
-                4 => last_ctimes.0 = Some(c.connection_time),
-                6 => last_ctimes.1 = Some(c.connection_time),
-                _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown IP version")),
-            }
-            self.history.insert(root_domain.to_owned(), last_ctimes);
+            info!("Awarded {} to action {}", reward, action);
 
             match self.instances.get_mut(&root_domain) {
                 Some(instance) => {
                     instance.give_reward(action, reward);
                     info!("EXP3 state {:?}", instance.history.last());
-                },
+                }
                 None => {} //assert!(reward == 0.0),
             }
         }
         Ok(())
     }
 
-    pub fn choose_query_type(&mut self, domain: &String) -> Result<QueryType> {
+    pub fn choose_action(&mut self, domain: &String) -> Result<(SocketAddr, QueryType)> {
         let root_domain = EXP3State::get_root_domain(domain);
         if !self.instances.contains_key(&root_domain) {
-            let instance = EXP3::new(2, 0.1, true, false);
+            let instance = EXP3::new(self.resolvers.len() * self.no_queries_type, 0.1, true, false);
             self.instances.insert(root_domain.to_owned(), instance);
         }
         let instance = self.instances.get_mut(&root_domain).unwrap();
@@ -1035,24 +1080,26 @@ impl EXP3State {
             action, root_domain
         );
         info!("EXP3 state {:?}", instance.history.last());
-        Ok(match action {
+        let query_type = match (action * 2 / self.no_queries_type) % 2 {
             0 => QueryType::A,
             1 => QueryType::AAAA,
             _ => return Err(Error::new(ErrorKind::InvalidData, "Unknown action")),
-        })
+        };
+        let resolver = self.resolvers.get(action / self.no_queries_type).unwrap();
+        Ok((*resolver, query_type))
     }
 
-    pub fn insert_in_cache(&mut self, record: DnsRecord) {
+    pub fn insert_in_cache(&mut self, resolver: SocketAddr, record: DnsRecord) {
         if let DnsRecord::UNKNOWN { .. } = record {
             return;
         }
         let domain = record.get_domain();
-        let v = match self.cache.get_mut(&domain) {
+        let v = match self.cache.get_mut(&(resolver.clone(), domain.clone())) {
             Some(v) => v,
             None => {
                 let v = Vec::new();
-                self.cache.insert(domain.clone(), v);
-                self.cache.get_mut(&domain).unwrap()
+                self.cache.insert((resolver.clone(), domain.clone()), v);
+                self.cache.get_mut(&(resolver, domain)).unwrap()
             }
         };
 
@@ -1060,9 +1107,15 @@ impl EXP3State {
         v.push(CachedRecord { record, expiration });
     }
 
-    pub fn retrieve_cache(&mut self, domain: &String, query_type: QueryType) -> Vec<DnsRecord> { // TODO: Extend it to return all records matching the query
+    pub fn retrieve_cache(
+        &mut self,
+        resolver: SocketAddr,
+        domain: &String,
+        query_type: QueryType,
+    ) -> Vec<DnsRecord> {
+        // TODO: Extend it to return all records matching the query
         let now = Instant::now();
-        let cr = match self.cache.get_mut(domain) {
+        let cr = match self.cache.get_mut(&(resolver, domain.to_string())) {
             Some(v) => {
                 v.retain(|c| c.expiration > now);
                 let cr = v.iter().find(|c| match (query_type, c.record.clone()) {
@@ -1092,7 +1145,7 @@ impl EXP3State {
                     r.set_ttl((cr.expiration - now).as_secs() as u32);
                     return match &r {
                         DnsRecord::CNAME { host, .. } => {
-                            let alias = &mut self.retrieve_cache(host, query_type);
+                            let alias = &mut self.retrieve_cache(resolver, host, query_type);
                             if !alias.is_empty() {
                                 let mut v = vec![r.to_owned()];
                                 v.append(alias);
@@ -1100,9 +1153,9 @@ impl EXP3State {
                             } else {
                                 vec![]
                             }
-                        },
-                        r => vec![r.to_owned()]
-                    }
+                        }
+                        r => vec![r.to_owned()],
+                    };
                 }
             };
         }
