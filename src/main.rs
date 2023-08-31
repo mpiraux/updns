@@ -8,6 +8,7 @@ use config::{Config, Hosts, MultipleInvalid, Parser};
 use futures_util::{future::join_all, StreamExt};
 use lazy_static::lazy_static;
 use logs::{error, info, warn};
+use rand::random;
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
@@ -16,6 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
+    vec,
 };
 use tokio::{
     io::{self, Error, ErrorKind, Result},
@@ -24,6 +26,7 @@ use tokio::{
     task::JoinError,
     time::{sleep_until, timeout, Instant},
 };
+use ipnet::IpNet;
 use updns::*;
 use watch::Watch;
 
@@ -31,7 +34,7 @@ const CONFIG_FILE: [&str; 2] = [".updns", "config"];
 const WATCH_INTERVAL: Duration = Duration::from_millis(5000);
 const DEFAULT_BIND: &str = "0.0.0.0:53";
 const DEFAULT_PROXY: [&str; 2] = ["8.8.8.8:53", "1.1.1.1:53"];
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5000);
 const DEFAULT_FEEDBACK_BIND: &str = "0.0.0.0:50000";
 
 lazy_static! {
@@ -39,6 +42,7 @@ lazy_static! {
     static ref HOSTS: RwLock<Hosts> = RwLock::new(Hosts::new());
     static ref TIMEOUT: RwLock<Duration> = RwLock::new(DEFAULT_TIMEOUT);
     static ref FEEDBACK: RwLock<Option<SocketAddr>> = RwLock::new(None);
+    static ref SUBNETS: RwLock<Vec<IpNet>> = RwLock::new(Vec::new());
 }
 
 #[macro_export]
@@ -115,7 +119,7 @@ async fn main() {
                 config.feedback = Some(DEFAULT_FEEDBACK_BIND.parse().unwrap());
             }
 
-            update_config(config.proxy, config.hosts, config.timeout, config.feedback).await;
+            update_config(config.proxy, config.hosts, config.timeout, config.feedback, config.subnets).await;
 
             // Run server
             for addr in config.bind {
@@ -132,6 +136,7 @@ async fn update_config(
     hosts: Hosts,
     timeout: Option<Duration>,
     feedback: Option<SocketAddr>,
+    subnets: Vec<IpNet>,
 ) {
     if proxy.is_empty() {
         proxy = DEFAULT_PROXY
@@ -156,6 +161,10 @@ async fn update_config(
         let mut w = FEEDBACK.write().await;
         *w = Some(feedback.unwrap_or(DEFAULT_FEEDBACK_BIND.parse().unwrap()));
     }
+    {
+        let mut w = SUBNETS.write().await;
+        *w = subnets;
+    }
 }
 
 async fn force_get_config(file: &Path) -> Config {
@@ -178,7 +187,7 @@ async fn watch_config(p: PathBuf, d: Duration) {
         info!("Reload the configuration file: {:?}", &p);
         if let Ok(parser) = Parser::new(&p).await {
             if let Ok(config) = parser.parse().await {
-                update_config(config.proxy, config.hosts, config.timeout, config.feedback).await;
+                update_config(config.proxy, config.hosts, config.timeout, config.feedback, config.subnets).await;
                 config.invalid.print();
             }
         }
@@ -205,10 +214,14 @@ async fn run_server(addr: SocketAddr, feedback_addr: SocketAddr, mode: RunMode) 
             exit!("Binding '{}' failed\n{:?}", feedback_addr, err)
         }
     };
-    let mut exp3_state = EXP3State::new("test", PROXY.read().await.iter().map(|e| *e).collect(), match mode {
-        RunMode::EXP3 => 2,
-        _ => 1,
-    });
+    let mut exp3_state = EXP3State::new(
+        "test",
+        PROXY.read().await.iter().map(|e| *e).collect(),
+        match mode {
+            RunMode::EXP3 => 2,
+            _ => 1,
+        },
+    );
     let mut pending_responses: HashMap<Instant, (SocketAddr, Vec<u8>)> = HashMap::new();
     let mut pending_timers: BinaryHeap<Reverse<Instant>> = BinaryHeap::new();
 
@@ -325,6 +338,49 @@ async fn get_answer(domain: &str, query: QueryType) -> Option<DnsRecord> {
         }
     }
     None
+}
+
+async fn prepare_query(question: DnsQuestion) -> DnsPacket {
+    let mut p = DnsPacket::new();
+    //p.header.
+    p.header.id = random();
+    p.header.recursion_desired = true;
+    p.header.authed_data = true;
+    let family = match question.qtype {
+        QueryType::AAAA => 6,
+        _ => 4,
+    };
+    
+    let ip = {
+        let subnets = SUBNETS.read().await;
+        subnets.iter().filter(|&ip| match (ip, family) {
+        (IpNet::V4(_), 4) => true,
+        (IpNet::V6(_), 6) => true,
+        _ => false
+        }).next().unwrap().clone()
+    };
+
+    let mut octets: Vec<u8> = match ip.addr() {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    octets.truncate((ip.prefix_len() + 7) as usize / 8);
+    
+    let csubnet = DnsOption::CSUBNET {
+        family,
+        source_netmask: ip.prefix_len(),
+        scope_netmask: 0,
+        client_subnet: octets,
+    };
+    p.resources.push(DnsRecord::OPT {
+        udp_payload_usize: 1200,
+        hb_rcode: 0,
+        edns_version: 0,
+        z: 0,
+        options: vec![csubnet],
+    });
+    p.questions.push(question);
+    p
 }
 
 async fn handle_request(
@@ -465,8 +521,7 @@ async fn handle_request(
                 request.resources.append(&mut response_packet.answers)
             }
         }
-        (RunMode::EXP3, _) |
-        (RunMode::EXP3V4, _) => {
+        (RunMode::EXP3, _) | (RunMode::EXP3V4, _) => {
             let domain = request.questions.get(0).unwrap().name.to_owned();
             if query.qtype == QueryType::A || query.qtype == QueryType::AAAA {
                 let responses: Vec<std::result::Result<(SocketAddr, Result<Vec<u8>>), JoinError>> = {
@@ -475,7 +530,7 @@ async fn handle_request(
                         .iter()
                         .map(|r| [(r.clone(), QueryType::A), (r.clone(), QueryType::AAAA)])
                         .flatten()
-                        .filter(|&(r, qt)| mode != RunMode::EXP3V4 || qt != QueryType::AAAA)
+                        .filter(|&(_, qt)| mode != RunMode::EXP3V4 || qt != QueryType::AAAA)
                         .filter(|&(r, qt)| exp3_state.retrieve_cache(r, &domain, qt).is_empty())
                         .collect();
 
@@ -517,10 +572,11 @@ async fn handle_request(
                 }
             }
 
-            if mode != RunMode::EXP3 && (query.qtype == QueryType::A
-                && exp3_state
-                    .retrieve_cache(default_res, &domain, QueryType::AAAA)
-                    .is_empty())
+            if mode != RunMode::EXP3
+                && (query.qtype == QueryType::A
+                    && exp3_state
+                        .retrieve_cache(default_res, &domain, QueryType::AAAA)
+                        .is_empty())
                 || (query.qtype == QueryType::AAAA
                     && exp3_state
                         .retrieve_cache(default_res, &domain, QueryType::A)
@@ -530,7 +586,9 @@ async fn handle_request(
                     request.answers.push(r);
                 }
             }
-            if request.answers.len() == 0 && (query.qtype == QueryType::AAAA || mode == RunMode::EXP3V4) {
+            if request.answers.len() == 0
+                && (query.qtype == QueryType::AAAA || mode == RunMode::EXP3V4)
+            {
                 let (resolver, query_type) = exp3_state.choose_action(&domain)?;
                 let answers = exp3_state.retrieve_cache(resolver, &domain, query_type);
                 for answer in answers {
@@ -560,41 +618,8 @@ async fn handle_request(
             }
         }
         (RunMode::Test, _) => {
-            let answers = match get_answer(&query.name, query.qtype).await {
-                Some(record) => Vec::from([record]),
-                None => {
-                    let ref mut other_request = request.clone();
-                    other_request.questions.get_mut(0).unwrap().qtype =
-                        if query.qtype == QueryType::A {
-                            QueryType::AAAA
-                        } else {
-                            QueryType::A
-                        };
-                    let ref mut buffer = BytePacketBuffer::new();
-                    other_request.write(buffer)?;
-
-                    let (_, response) = proxy(&buffer.buf[..buffer.pos]).await?;
-                    let ref mut response_buffer = BytePacketBuffer::new();
-                    response_buffer.buf[..response.len()].copy_from_slice(&response);
-                    let response_packet = DnsPacket::from_buffer(response_buffer)?;
-                    response_packet.answers
-                }
-            };
-            for answer in answers {
-                request.answers.push(match answer {
-                    DnsRecord::A { domain, addr, ttl } => DnsRecord::AAAA {
-                        domain,
-                        addr: addr.to_ipv6_mapped(),
-                        ttl,
-                    },
-                    _ => answer,
-                });
-            }
-            if query.qtype == QueryType::A {
-                it = Instant::now()
-                    .checked_add(Duration::from_millis(20))
-                    .unwrap();
-            }
+            println!("{:?}", request);
+            return proxy(&req.buf[..len]).await;
         }
     }
 

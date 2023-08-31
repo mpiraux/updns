@@ -60,6 +60,11 @@ impl BytePacketBuffer {
         Ok(res)
     }
 
+    pub fn read_range(&mut self, len: usize) -> Result<&[u8]> {
+        self.step(len)?;
+        self.get_range(self.pos() - len, len)
+    }
+
     fn get(&mut self, pos: usize) -> Result<u8> {
         if pos >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
@@ -67,7 +72,7 @@ impl BytePacketBuffer {
         Ok(self.buf[pos])
     }
 
-    pub fn get_range(&mut self, start: usize, len: usize) -> Result<&[u8]> {
+    pub fn get_range(&self, start: usize, len: usize) -> Result<&[u8]> {
         if start + len >= MAX_BUFFER_SIZE {
             return Err(Error::new(ErrorKind::InvalidInput, "End of buffer"));
         }
@@ -349,6 +354,7 @@ pub enum QueryType {
     SOA,   // 6
     MX,    // 15
     AAAA,  // 28
+    OPT,   // 41
 }
 
 impl QueryType {
@@ -361,6 +367,7 @@ impl QueryType {
             QueryType::SOA => 6,
             QueryType::MX => 15,
             QueryType::AAAA => 28,
+            QueryType::OPT => 41,
         }
     }
 
@@ -372,6 +379,7 @@ impl QueryType {
             6 => QueryType::SOA,
             15 => QueryType::MX,
             28 => QueryType::AAAA,
+            41 => QueryType::OPT,
             _ => QueryType::UNKNOWN(num),
         }
     }
@@ -407,6 +415,92 @@ impl DnsQuestion {
         buffer.write_u16(1)?;
 
         Ok(())
+    }
+}
+
+#[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
+pub enum OptionType {
+    UNKNOWN(u16),
+    CSUBNET, // 8
+}
+
+impl OptionType {
+    pub fn to_num(&self) -> u16 {
+        match *self {
+            OptionType::UNKNOWN(x) => x,
+            OptionType::CSUBNET => 8,
+        }
+    }
+
+    pub fn from_num(num: u16) -> OptionType {
+        match num {
+            8 => OptionType::CSUBNET,
+            _ => OptionType::UNKNOWN(num),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DnsOption {
+    UNKNOWN {
+        option_code: u16,
+        option_data: Vec<u8>,
+    },
+    CSUBNET {
+        family: u16,
+        source_netmask: u8,
+        scope_netmask: u8,
+        client_subnet: Vec<u8>,
+    },
+}
+
+impl DnsOption {
+    pub fn read(buffer: &mut BytePacketBuffer) -> Result<DnsOption> {
+        let option_code: OptionType = OptionType::from_num(buffer.read_u16()?);
+        let option_len: usize = buffer.read_u16()?.into();
+        let o = match option_code {
+            OptionType::UNKNOWN(oc) => DnsOption::UNKNOWN {
+                option_code: oc,
+                option_data: buffer.read_range(option_len)?.to_vec(),
+            },
+            OptionType::CSUBNET => DnsOption::CSUBNET {
+                family: buffer.read_u16()?,
+                source_netmask: buffer.read()?,
+                scope_netmask: buffer.read()?,
+                client_subnet: buffer.read_range(option_len - (2 + 1 + 1))?.into(),
+            },
+        };
+        Ok(o)
+    }
+
+    pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
+        match self {
+            DnsOption::UNKNOWN {
+                option_code: option_type,
+                option_data,
+            } => {
+                buffer.write_u16(*option_type)?;
+                buffer.write_u16(option_data.len() as u16)?;
+                buffer.write_buf(option_data)?;
+
+                Ok(2 + 2 + option_data.len())
+            }
+            DnsOption::CSUBNET {
+                family,
+                source_netmask,
+                scope_netmask,
+                client_subnet,
+            } => {
+                buffer.write_u16(OptionType::CSUBNET.to_num())?;
+                buffer.write_u16(2 + 1 + 1 + client_subnet.len() as u16)?;
+                buffer.write_u16(*family)?;
+                buffer.write(*source_netmask)?;
+                buffer.write(*scope_netmask)?;
+                buffer.write_buf(client_subnet)?;
+
+                Ok(2 + 2 + 1 + 1 + client_subnet.len() as usize)
+            }
+        }
     }
 }
 
@@ -458,6 +552,13 @@ pub enum DnsRecord {
         addr: Ipv6Addr,
         ttl: u32,
     }, // 28
+    OPT {
+        udp_payload_usize: u16,
+        hb_rcode: u8,
+        edns_version: u8,
+        z: u16,
+        options: Vec<DnsOption>,
+    },
 }
 
 impl DnsRecord {
@@ -564,6 +665,22 @@ impl DnsRecord {
                     ttl: ttl,
                 })
             }
+            QueryType::OPT => {
+                let mut l = data_len as usize;
+                let mut options = vec![];
+                while l > 0 {
+                    let pos = buffer.pos();
+                    options.push(DnsOption::read(buffer)?);
+                    l = l - (buffer.pos() - pos);
+                }
+                Ok(DnsRecord::OPT {
+                    udp_payload_usize: class,
+                    hb_rcode: (ttl >> 24) as u8,
+                    edns_version: ((0x00FF0000 & ttl) >> 16) as u8,
+                    z: (0xFFFF & ttl) as u16,
+                    options,
+                })
+            }
             QueryType::UNKNOWN(_) => {
                 let data_bytes = buffer.get_range(buffer.pos, data_len as usize)?.to_vec();
                 buffer.step(data_bytes.len())?;
@@ -584,8 +701,8 @@ impl DnsRecord {
     pub fn write(&self, buffer: &mut BytePacketBuffer) -> Result<usize> {
         let start_pos = buffer.pos();
 
-        match *self {
-            DnsRecord::A {
+        match self {
+            &DnsRecord::A {
                 ref domain,
                 ref addr,
                 ttl,
@@ -602,7 +719,7 @@ impl DnsRecord {
                 buffer.write_u8(octets[2])?;
                 buffer.write_u8(octets[3])?;
             }
-            DnsRecord::NS {
+            &DnsRecord::NS {
                 ref domain,
                 ref host,
                 ttl,
@@ -620,7 +737,7 @@ impl DnsRecord {
                 let size = buffer.pos() - (pos + 2);
                 buffer.set_u16(pos, size as u16)?;
             }
-            DnsRecord::CNAME {
+            &DnsRecord::CNAME {
                 ref domain,
                 ref host,
                 ttl,
@@ -638,7 +755,7 @@ impl DnsRecord {
                 let size = buffer.pos() - (pos + 2);
                 buffer.set_u16(pos, size as u16)?;
             }
-            DnsRecord::SOA {
+            &DnsRecord::SOA {
                 ref domain,
                 ttl,
                 ref name,
@@ -668,7 +785,7 @@ impl DnsRecord {
                 let size = buffer.pos() - (pos + 2);
                 buffer.set_u16(pos, size as u16)?;
             }
-            DnsRecord::MX {
+            &DnsRecord::MX {
                 ref domain,
                 priority,
                 ref host,
@@ -688,7 +805,7 @@ impl DnsRecord {
                 let size = buffer.pos() - (pos + 2);
                 buffer.set_u16(pos, size as u16)?;
             }
-            DnsRecord::AAAA {
+            &DnsRecord::AAAA {
                 ref domain,
                 ref addr,
                 ttl,
@@ -703,7 +820,24 @@ impl DnsRecord {
                     buffer.write_u16(*octet)?;
                 }
             }
-            DnsRecord::UNKNOWN {
+            DnsRecord::OPT {
+                udp_payload_usize,
+                hb_rcode,
+                edns_version,
+                z,
+                options,
+            } => {
+                buffer.write_qname("")?;
+                buffer.write_u16(QueryType::OPT.to_num())?;
+                buffer.write_u16(*udp_payload_usize)?;
+                buffer.write(*hb_rcode)?;
+                buffer.write(*edns_version)?;
+                buffer.write_u16(*z)?;
+                for o in options {
+                    o.write(buffer)?;
+                }
+            }
+            &DnsRecord::UNKNOWN {
                 ref domain,
                 qtype,
                 class,
@@ -724,14 +858,15 @@ impl DnsRecord {
     }
 
     pub fn get_ttl(&self) -> u32 {
-        *match self {
-            DnsRecord::UNKNOWN { ttl, .. } => ttl,
-            DnsRecord::A { ttl, .. } => ttl,
-            DnsRecord::NS { ttl, .. } => ttl,
-            DnsRecord::CNAME { ttl, .. } => ttl,
-            DnsRecord::SOA { ttl, .. } => ttl,
-            DnsRecord::MX { ttl, .. } => ttl,
-            DnsRecord::AAAA { ttl, .. } => ttl,
+        match self {
+            &DnsRecord::UNKNOWN { ttl, .. } => ttl,
+            &DnsRecord::A { ttl, .. } => ttl,
+            &DnsRecord::NS { ttl, .. } => ttl,
+            &DnsRecord::CNAME { ttl, .. } => ttl,
+            &DnsRecord::SOA { ttl, .. } => ttl,
+            &DnsRecord::MX { ttl, .. } => ttl,
+            &DnsRecord::AAAA { ttl, .. } => ttl,
+            &DnsRecord::OPT { .. } => 0,
         }
     }
 
@@ -744,6 +879,7 @@ impl DnsRecord {
             DnsRecord::SOA { ttl, .. } => ttl,
             DnsRecord::MX { ttl, .. } => ttl,
             DnsRecord::AAAA { ttl, .. } => ttl,
+            DnsRecord::OPT { .. } => return,
         }) = new_ttl;
     }
 
@@ -756,6 +892,7 @@ impl DnsRecord {
             DnsRecord::SOA { domain, .. } => domain,
             DnsRecord::MX { domain, .. } => domain,
             DnsRecord::AAAA { domain, .. } => domain,
+            DnsRecord::OPT { .. } => return "".to_string(),
         })
         .clone()
     }
@@ -1027,7 +1164,7 @@ impl EXP3State {
                 {
                     better = true;
                     for ((resolver, version), ct) in v.iter() {
-                        if resolver != &last_decision.resolver && version != &last_decision.version
+                        if resolver != &last_decision.resolver || version != &last_decision.version
                         {
                             if c.connection_time > *ct {
                                 better = false;
@@ -1070,7 +1207,12 @@ impl EXP3State {
     pub fn choose_action(&mut self, domain: &String) -> Result<(SocketAddr, QueryType)> {
         let root_domain = EXP3State::get_root_domain(domain);
         if !self.instances.contains_key(&root_domain) {
-            let instance = EXP3::new(self.resolvers.len() * self.no_queries_type, 0.1, true, false);
+            let instance = EXP3::new(
+                self.resolvers.len() * self.no_queries_type,
+                0.1,
+                true,
+                false,
+            );
             self.instances.insert(root_domain.to_owned(), instance);
         }
         let instance = self.instances.get_mut(&root_domain).unwrap();

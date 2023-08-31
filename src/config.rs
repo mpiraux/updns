@@ -1,5 +1,6 @@
 use crate::matcher::Matcher;
 use futures_util::future::{BoxFuture, FutureExt};
+use ipnet::IpNet;
 use logs::error;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -71,6 +72,7 @@ impl MultipleInvalid for Vec<Invalid> {
 pub enum InvalidType {
     Regex,
     SocketAddr,
+    IpNet,
     IpAddr,
     Timeout,
     Other,
@@ -80,6 +82,7 @@ impl InvalidType {
     pub fn description(&self) -> &str {
         match self {
             InvalidType::SocketAddr => "Cannot parse socket address",
+            InvalidType::IpNet => "Cannot parse ip prefix",
             InvalidType::IpAddr => "Cannot parse ip address",
             InvalidType::Regex => "Cannot parse regular expression",
             InvalidType::Timeout => "Cannot parse timeout",
@@ -125,6 +128,7 @@ pub struct Config {
     pub bind: Vec<SocketAddr>,
     pub proxy: Vec<SocketAddr>,
     pub feedback: Option<SocketAddr>,
+    pub subnets: Vec<IpNet>,
     pub hosts: Hosts,
     pub timeout: Option<Duration>,
     pub invalid: Vec<Invalid>,
@@ -137,6 +141,7 @@ impl Config {
             bind: Vec::new(),
             proxy: Vec::new(),
             feedback: None,
+            subnets: Vec::new(),
             invalid: Vec::new(),
             timeout: None,
         }
@@ -145,6 +150,7 @@ impl Config {
     fn extend(&mut self, other: Self) {
         self.bind.extend(other.bind);
         self.proxy.extend(other.proxy);
+        self.subnets.extend(other.subnets);
         self.hosts.extend(other.hosts);
         self.invalid.extend(other.invalid);
         if other.timeout.is_some() {
@@ -294,6 +300,10 @@ impl Parser {
                         Ok(addr) => config.feedback = Some(addr),
                         Err(_) => invalid!(InvalidType::SocketAddr),
                     },
+                    "subnet" => match value.parse::<IpNet>() {
+                        Ok(a) => config.subnets.push(a),
+                        Err(_) => invalid!(InvalidType::IpNet),
+                    },
                     _ => match Self::record(key, value) {
                         Ok(record) => config.hosts.push(record),
                         Err(kind) => invalid!(kind),
@@ -339,6 +349,8 @@ mod tests {
             config.feedback,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1234))
         );
+
+        assert_eq!(config.subnets, vec!["127.0.0.1/8".parse().unwrap()]);
 
         let ip_addresses: Vec<_> = config.hosts.record.iter().map(|(_, ip)| *ip).collect();
         assert_eq!(
